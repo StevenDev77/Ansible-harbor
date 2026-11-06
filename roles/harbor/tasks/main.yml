@@ -1,0 +1,527 @@
+---
+- name: Validar plataforma y variables requeridas
+  ansible.builtin.assert:
+    that:
+      - ansible_os_family == "RedHat"
+      - harbor_version == "v2.10.2"
+      - harbor_hostname | length > 0
+      - harbor_tls_cert_src | length > 0
+      - harbor_tls_key_src | length > 0
+      - harbor_admin_password | length >= 12
+      - harbor_database_password | length >= 12
+      - harbor_api_ca_src | length > 0
+      - not harbor_configure_replication or harbor_replication_source_user | length > 0
+      - not harbor_configure_replication or harbor_replication_source_password | length >= 12
+    fail_msg: >-
+      Configure AlmaLinux/RHEL, harbor_hostname como IP o DNS que coincida con el SAN,
+      certificados TLS y contraseñas en Ansible Vault antes del despliegue. Esta
+      instalación se fija a v2.10.2 para ser compatible con el Harbor actual.
+
+- name: Comprobar certificado TLS en el nodo de control
+  ansible.builtin.stat:
+    path: "{{ item }}"
+  delegate_to: localhost
+  become: false
+  loop:
+    - "{{ harbor_tls_cert_src }}"
+    - "{{ harbor_tls_key_src }}"
+    - "{{ harbor_api_ca_src }}"
+  register: harbor_tls_source_files
+
+- name: Comprobar CA institucional opcional del origen en el nodo de control
+  ansible.builtin.stat:
+    path: "{{ harbor_replication_source_ca_src }}"
+  delegate_to: localhost
+  become: false
+  register: harbor_replication_source_ca_file
+  when:
+    - harbor_configure_replication | bool
+    - harbor_replication_source_ca_src | length > 0
+
+- name: Rechazar CA institucional del origen inexistente
+  ansible.builtin.assert:
+    that:
+      - harbor_replication_source_ca_file.stat.exists
+      - harbor_replication_source_ca_file.stat.isreg
+    fail_msg: "harbor_replication_source_ca_src no apunta a un certificado institucional válido."
+  when:
+    - harbor_configure_replication | bool
+    - harbor_replication_source_ca_src | length > 0
+
+- name: Rechazar certificados TLS inexistentes
+  ansible.builtin.assert:
+    that:
+      - item.stat.exists
+      - item.stat.isreg
+    fail_msg: "No se encuentra un archivo TLS requerido en el nodo de control."
+  loop: "{{ harbor_tls_source_files.results }}"
+  no_log: true
+
+- name: Verificar SAN IP del certificado Harbor
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ harbor_tls_cert_src }}"
+      - -checkip
+      - "{{ harbor_hostname }}"
+      - -noout
+  delegate_to: localhost
+  become: false
+  register: harbor_certificate_san_check
+  changed_when: false
+  when: harbor_hostname is match('^[0-9]+(\\.[0-9]+){3}$')
+  failed_when: harbor_certificate_san_check.rc != 0
+
+- name: Verificar SAN DNS del certificado Harbor
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ harbor_tls_cert_src }}"
+      - -checkhost
+      - "{{ harbor_hostname }}"
+      - -noout
+  delegate_to: localhost
+  become: false
+  register: harbor_certificate_san_check
+  changed_when: false
+  when: harbor_hostname is not match('^[0-9]+(\\.[0-9]+){3}$')
+  failed_when: harbor_certificate_san_check.rc != 0
+
+- name: Comprobar que /app es un punto de montaje y tiene capacidad suficiente
+  ansible.builtin.assert:
+    that:
+      - ansible_mounts | selectattr('mount', 'equalto', harbor_data_mountpoint) | list | length == 1
+    fail_msg: "{{ harbor_data_mountpoint }} debe ser un filesystem montado para los datos persistentes de Harbor."
+
+- name: Guardar información del filesystem de Harbor
+  ansible.builtin.set_fact:
+    harbor_data_mount: "{{ ansible_mounts | selectattr('mount', 'equalto', harbor_data_mountpoint) | first }}"
+
+- name: Validar espacio libre para la réplica inicial
+  ansible.builtin.assert:
+    that:
+      - harbor_data_mount.size_available | int >= harbor_min_free_bytes | int
+    fail_msg: >-
+      El filesystem {{ harbor_data_mountpoint }} no tiene el mínimo requerido de
+      {{ (harbor_min_free_bytes | int / 1073741824) | round(1) }} GiB libres.
+      Amplíe el disco antes de copiar los aproximadamente 12 GiB actuales del registry
+      y deje margen para crecimiento, retención y garbage collection.
+
+- name: Comprobar si ya existe un despliegue Harbor en esta ruta
+  ansible.builtin.stat:
+    path: "{{ harbor_install_dir }}/docker-compose.yml"
+  register: harbor_compose_file
+
+- name: Comprobar directorio de datos preexistente en instalación nueva
+  ansible.builtin.stat:
+    path: "{{ harbor_data_volume }}"
+  register: ansible_stat_data_volume
+
+- name: Buscar datos preexistentes en instalación nueva
+  ansible.builtin.find:
+    paths: "{{ harbor_data_volume }}"
+    hidden: true
+    recurse: false
+    file_type: any
+  register: harbor_existing_data
+  when:
+    - not harbor_compose_file.stat.exists
+    - ansible_stat_data_volume.stat.exists
+
+- name: Evitar inicializar encima de datos existentes
+  ansible.builtin.assert:
+    that:
+      - harbor_existing_data.matched | default(0) | int == 0
+    fail_msg: >-
+      {{ harbor_data_volume }} ya contiene datos, pero no se encontró un Compose
+      Harbor en {{ harbor_install_dir }}. Revise el nodo antes de continuar.
+  when:
+    - not harbor_compose_file.stat.exists
+    - ansible_stat_data_volume.stat.exists
+
+- name: Instalar complemento DNF requerido por Docker
+  ansible.builtin.dnf:
+    name: dnf-plugins-core
+    state: present
+
+- name: Configurar repositorio oficial de Docker CE
+  ansible.builtin.get_url:
+    url: https://download.docker.com/linux/centos/docker-ce.repo
+    dest: /etc/yum.repos.d/docker-ce.repo
+    owner: root
+    group: root
+    mode: "0644"
+
+- name: Instalar Docker Engine y Docker Compose
+  ansible.builtin.dnf:
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - docker-buildx-plugin
+      - docker-compose-plugin
+    state: present
+
+- name: Habilitar e iniciar Docker
+  ansible.builtin.service:
+    name: docker
+    enabled: true
+    state: started
+
+- name: Crear directorios persistentes de Harbor
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "/app/harbor", mode: "0750" }
+    - { path: "{{ harbor_data_volume }}", mode: "0750" }
+    - { path: "{{ harbor_tls_dir }}", mode: "0750" }
+
+- name: Instalar certificado TLS del nodo
+  ansible.builtin.copy:
+    src: "{{ harbor_tls_cert_src }}"
+    dest: "{{ harbor_tls_cert_path }}"
+    owner: root
+    group: root
+    mode: "0644"
+  register: harbor_tls_cert_result
+
+- name: Instalar llave privada TLS del nodo
+  ansible.builtin.copy:
+    src: "{{ harbor_tls_key_src }}"
+    dest: "{{ harbor_tls_key_path }}"
+    owner: root
+    group: root
+    mode: "0600"
+  register: harbor_tls_key_result
+
+- name: Comprobar instalador offline local en el nodo de control
+  ansible.builtin.stat:
+    path: "{{ harbor_installer_src }}"
+  delegate_to: localhost
+  become: false
+  register: harbor_offline_installer_file
+  when: harbor_installer_src | length > 0
+
+- name: Validar instalador offline local
+  ansible.builtin.assert:
+    that:
+      - harbor_offline_installer_file.stat.exists
+      - harbor_offline_installer_file.stat.isreg
+    fail_msg: "harbor_installer_src no apunta a un archivo offline válido."
+  when: harbor_installer_src | length > 0
+
+- name: Copiar instalador offline de Harbor
+  ansible.builtin.copy:
+    src: "{{ harbor_installer_src }}"
+    dest: "{{ harbor_installer_archive }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: harbor_installer_src | length > 0
+
+- name: Descargar instalador online de Harbor
+  ansible.builtin.get_url:
+    url: "{{ harbor_installer_url }}"
+    dest: "{{ harbor_installer_archive }}"
+    owner: root
+    group: root
+    mode: "0600"
+  when: harbor_installer_src | length == 0
+
+- name: Extraer instalador de Harbor
+  ansible.builtin.unarchive:
+    src: "{{ harbor_installer_archive }}"
+    dest: /opt
+    remote_src: true
+    creates: "{{ harbor_install_dir }}/install.sh"
+
+- name: Generar configuración protegida de Harbor
+  ansible.builtin.template:
+    src: harbor.yml.j2
+    dest: "{{ harbor_install_dir }}/harbor.yml"
+    owner: root
+    group: root
+    mode: "0600"
+  register: harbor_config_result
+  no_log: true
+
+- name: Ejecutar instalador de Harbor en una instalación nueva
+  ansible.builtin.command:
+    cmd: ./install.sh
+    chdir: "{{ harbor_install_dir }}"
+    creates: "{{ harbor_install_dir }}/docker-compose.yml"
+  when: not harbor_compose_file.stat.exists
+
+- name: Regenerar configuración si cambió Harbor en una instalación existente
+  ansible.builtin.command:
+    cmd: ./prepare
+    chdir: "{{ harbor_install_dir }}"
+  when:
+    - harbor_compose_file.stat.exists
+    - harbor_config_result.changed or harbor_tls_cert_result.changed or harbor_tls_key_result.changed
+
+- name: Crear directorio de CA de confianza para Harbor
+  ansible.builtin.file:
+    path: "{{ harbor_trust_cert_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when:
+    - harbor_configure_replication | bool
+    - harbor_replication_source_ca_src | length > 0
+
+- name: Instalar CA institucional opcional del origen en Harbor
+  ansible.builtin.copy:
+    src: "{{ harbor_replication_source_ca_src }}"
+    dest: "{{ harbor_trust_cert_dir }}/harbor-source-institutional-ca.crt"
+    owner: root
+    group: root
+    mode: "0644"
+  register: harbor_replication_source_ca_result
+  when:
+    - harbor_configure_replication | bool
+    - harbor_replication_source_ca_src | length > 0
+
+- name: Levantar Harbor con Docker Compose
+  ansible.builtin.command:
+    cmd: docker compose up -d
+    chdir: "{{ harbor_install_dir }}"
+  register: harbor_compose_up
+  changed_when: >-
+    'Created' in harbor_compose_up.stdout or
+    'Recreated' in harbor_compose_up.stdout or
+    'Started' in harbor_compose_up.stdout or
+    'Pulled' in harbor_compose_up.stdout
+
+- name: Reiniciar Harbor existente para cargar una CA de réplica nueva
+  ansible.builtin.command:
+    cmd: docker compose restart
+    chdir: "{{ harbor_install_dir }}"
+  when:
+    - harbor_compose_file.stat.exists
+    - harbor_replication_source_ca_result.changed | default(false)
+
+- name: Esperar el puerto HTTPS de Harbor
+  ansible.builtin.wait_for:
+    host: 127.0.0.1
+    port: "{{ harbor_https_port }}"
+    delay: 5
+    timeout: 600
+
+- name: Comprobar si existen proyectos requeridos por los pipelines
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/projects?project_name={{ item | urlencode }}"
+    method: HEAD
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    status_code: [200, 404]
+  loop: "{{ harbor_projects }}"
+  register: harbor_project_checks
+  no_log: true
+  when: harbor_projects | length > 0
+
+- name: Crear proyectos requeridos por los pipelines
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/projects"
+    method: POST
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    body_format: json
+    body:
+      project_name: "{{ item.item }}"
+      public: false
+    status_code: 201
+  loop: "{{ harbor_project_checks.results | default([]) | selectattr('status', 'equalto', 404) | list }}"
+  no_log: true
+  when: harbor_projects | length > 0
+
+- name: Listar endpoints de registro configurados en Harbor
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/registries?page=1&page_size=100"
+    method: GET
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    status_code: 200
+    return_content: true
+  register: harbor_registries_before
+  no_log: true
+  when: harbor_configure_replication | bool
+
+- name: Crear endpoint de origen Harbor si no existe
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/registries"
+    method: POST
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    body_format: json
+    body:
+      name: "{{ harbor_replication_endpoint_name }}"
+      description: Harbor primario .207, configurado por Ansible
+      type: harbor
+      url: "{{ harbor_replication_source_url }}"
+      credential:
+        type: basic
+        access_key: "{{ harbor_replication_source_user }}"
+        access_secret: "{{ harbor_replication_source_password }}"
+      insecure: false
+    status_code: 201
+  no_log: true
+  when:
+    - harbor_configure_replication | bool
+    - harbor_registries_before.json | selectattr('name', 'equalto', harbor_replication_endpoint_name) | list | length == 0
+
+- name: Actualizar endpoint de origen existente con las credenciales de Vault
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/registries/{{ (harbor_registries_before.json | selectattr('name', 'equalto', harbor_replication_endpoint_name) | first).id }}"
+    method: PUT
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    body_format: json
+    body:
+      name: "{{ harbor_replication_endpoint_name }}"
+      description: Harbor primario .207, configurado por Ansible
+      url: "{{ harbor_replication_source_url }}"
+      credential_type: basic
+      access_key: "{{ harbor_replication_source_user }}"
+      access_secret: "{{ harbor_replication_source_password }}"
+      insecure: false
+    status_code: 200
+  no_log: true
+  when:
+    - harbor_configure_replication | bool
+    - harbor_registries_before.json | selectattr('name', 'equalto', harbor_replication_endpoint_name) | list | length > 0
+
+- name: Consultar endpoint de origen tras asegurar su creación
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/registries?page=1&page_size=100"
+    method: GET
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    status_code: 200
+    return_content: true
+  register: harbor_registries_after
+  no_log: true
+  when: harbor_configure_replication | bool
+
+- name: Guardar endpoint Harbor de origen
+  ansible.builtin.set_fact:
+    harbor_source_registry: "{{ harbor_registries_after.json | selectattr('name', 'equalto', harbor_replication_endpoint_name) | list | first }}"
+  no_log: true
+  when: harbor_configure_replication | bool
+
+- name: Verificar endpoint Harbor de origen
+  ansible.builtin.assert:
+    that:
+      - harbor_source_registry.id is defined
+    fail_msg: "No se pudo encontrar el endpoint de origen registrado en Harbor."
+  when: harbor_configure_replication | bool
+  no_log: true
+
+- name: Listar reglas de replicación de Harbor
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/replication/policies?page=1&page_size=100"
+    method: GET
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    status_code: 200
+    return_content: true
+  register: harbor_replication_policies
+  no_log: true
+  when: harbor_configure_replication | bool
+
+- name: Crear regla pull desde .207 si no existe
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/replication/policies"
+    method: POST
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    body_format: json
+    body:
+      name: "{{ harbor_replication_policy_name }}"
+      description: Replicación pull programada cada 15 minutos desde Harbor .207
+      src_registry:
+        id: "{{ harbor_source_registry.id | int }}"
+      dest_namespace: ""
+      trigger:
+        type: scheduled
+        trigger_settings:
+          cron: "{{ harbor_replication_cron }}"
+      filters:
+        - type: name
+          value: "**"
+          decoration: matches
+        - type: tag
+          value: "**"
+          decoration: matches
+      deletion: false
+      override: true
+      enabled: true
+      speed: -1
+      copy_by_chunk: true
+    status_code: 201
+  no_log: true
+  when:
+    - harbor_configure_replication | bool
+    - harbor_replication_policies.json | selectattr('name', 'equalto', harbor_replication_policy_name) | list | length == 0
+
+- name: Actualizar regla pull existente desde .207
+  ansible.builtin.uri:
+    url: "https://{{ harbor_hostname }}/api/v2.0/replication/policies/{{ (harbor_replication_policies.json | selectattr('name', 'equalto', harbor_replication_policy_name) | first).id }}"
+    method: PUT
+    user: admin
+    password: "{{ harbor_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    body_format: json
+    body:
+      name: "{{ harbor_replication_policy_name }}"
+      description: Replicación pull programada cada 15 minutos desde Harbor .207
+      src_registry:
+        id: "{{ harbor_source_registry.id | int }}"
+      dest_namespace: ""
+      trigger:
+        type: scheduled
+        trigger_settings:
+          cron: "{{ harbor_replication_cron }}"
+      filters:
+        - type: name
+          value: "**"
+          decoration: matches
+        - type: tag
+          value: "**"
+          decoration: matches
+      deletion: false
+      override: true
+      enabled: true
+      speed: -1
+      copy_by_chunk: true
+    status_code: 200
+  no_log: true
+  when:
+    - harbor_configure_replication | bool
+    - harbor_replication_policies.json | selectattr('name', 'equalto', harbor_replication_policy_name) | list | length > 0

@@ -1,0 +1,9 @@
+---
+- name: Configurar CA y mirrors Harbor en nodos RKE2
+  hosts: rke2_nodes
+  become: true
+  gather_facts: true
+  serial: 1
+
+  roles:
+    - role: rke2_registry

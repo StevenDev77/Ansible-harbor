@@ -1,0 +1,77 @@
+---
+- name: Validar servicio RKE2 y credenciales requeridas
+  ansible.builtin.assert:
+    that:
+      - rke2_service in ['rke2-server', 'rke2-agent']
+      - rke2_harbor_ca_src | length > 0
+      - rke2_harbor_registry_auth is mapping
+      - rke2_harbor_source_registry in rke2_harbor_registry_auth
+      - rke2_harbor_endpoints | length == 3
+      - rke2_harbor_endpoints | difference(rke2_harbor_registry_auth.keys() | list) | length == 0
+    fail_msg: >-
+      Configure rke2_service, the CA file and pull credentials for the DNS alias
+      plus every Harbor endpoint in Ansible Vault before applying.
+  no_log: true
+
+- name: Validar credenciales de lectura para cada endpoint
+  ansible.builtin.assert:
+    that:
+      - item in rke2_harbor_registry_auth
+      - rke2_harbor_registry_auth[item].username | default('') | length > 0
+      - rke2_harbor_registry_auth[item].password | default('') | length > 0
+    fail_msg: "Faltan credenciales de lectura para {{ item }}."
+  loop: "{{ [rke2_harbor_source_registry] + rke2_harbor_endpoints }}"
+  no_log: true
+
+- name: Comprobar CA de Harbor en el nodo de control
+  ansible.builtin.stat:
+    path: "{{ rke2_harbor_ca_src }}"
+  delegate_to: localhost
+  become: false
+  register: rke2_harbor_ca_file
+
+- name: Rechazar CA inexistente
+  ansible.builtin.assert:
+    that:
+      - rke2_harbor_ca_file.stat.exists
+      - rke2_harbor_ca_file.stat.isreg
+    fail_msg: "No se encuentra la CA de Harbor en el nodo de control."
+
+- name: Comprobar que el servicio RKE2 existe en el nodo
+  ansible.builtin.service_facts:
+
+- name: Validar el servicio RKE2 de este nodo
+  ansible.builtin.assert:
+    that:
+      - "(rke2_service + '.service') in ansible_facts.services"
+    fail_msg: "El servicio {{ rke2_service }} no está instalado en este nodo."
+
+- name: Crear directorio de configuración RKE2
+  ansible.builtin.file:
+    path: /etc/rancher/rke2
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Instalar CA privada de Harbor para containerd
+  ansible.builtin.copy:
+    src: "{{ rke2_harbor_ca_src }}"
+    dest: "{{ rke2_harbor_ca_dest }}"
+    owner: root
+    group: root
+    mode: "0644"
+  notify: Reiniciar servicio RKE2 para aplicar mirrors
+
+- name: Generar configuración de mirrors y credenciales
+  ansible.builtin.template:
+    src: registries.yaml.j2
+    dest: /etc/rancher/rke2/registries.yaml
+    owner: root
+    group: root
+    mode: "0600"
+  no_log: true
+  notify: Reiniciar servicio RKE2 para aplicar mirrors
+
+- name: Aplicar cambios de registry de manera serial
+  ansible.builtin.meta: flush_handlers

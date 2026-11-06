@@ -1,0 +1,320 @@
+---
+- name: Recrear /opt en Harbor réplica .134 y ampliar /app
+  hosts: harbor_134
+  become: true
+  gather_facts: true
+  serial: 1
+
+  vars:
+    harbor_opt_expected_host: harbor_134
+    harbor_opt_expected_ip: 192.168.114.134
+    harbor_opt_lv_device: /dev/vgiess/opt
+    harbor_opt_lv_size: 2G
+    harbor_opt_min_lv_bytes: 2147483648
+    harbor_opt_old_uuid: 1351a5a7-6b0f-470f-a77d-bef3bab2ba4b
+    harbor_opt_backup_dir: /root/opt_backup
+    harbor_opt_fstab_backup: /etc/fstab.bak
+    harbor_opt_confirmation: REBUILD_OPT_ON_192.168.114.134
+    harbor_app_lv_device: /dev/vgiess/app
+
+  tasks:
+    - name: Validar confirmación explícita y destino esperado
+      ansible.builtin.assert:
+        that:
+          - harbor_opt_rebuild_confirm | default('') == harbor_opt_confirmation
+          - inventory_hostname == harbor_opt_expected_host
+          - ansible_host == harbor_opt_expected_ip
+        fail_msg: >-
+          Operación destructiva cancelada. Limita la ejecución a harbor_134 y pasa
+          -e harbor_opt_rebuild_confirm={{ harbor_opt_confirmation }} solo después
+          de revisar el respaldo y el layout del disco.
+
+    - name: Confirmar montajes y filesystem actuales
+      ansible.builtin.assert:
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', '/opt') | list | length == 1
+          - (ansible_mounts | selectattr('mount', 'equalto', '/opt') | first).device in ['/dev/mapper/vgiess-opt', harbor_opt_lv_device]
+          - (ansible_mounts | selectattr('mount', 'equalto', '/opt') | first).fstype == 'xfs'
+          - ansible_mounts | selectattr('mount', 'equalto', '/app') | list | length == 1
+          - (ansible_mounts | selectattr('mount', 'equalto', '/app') | first).device in ['/dev/mapper/vgiess-app', harbor_app_lv_device]
+          - (ansible_mounts | selectattr('mount', 'equalto', '/app') | first).fstype in ['xfs', 'ext4']
+        fail_msg: >-
+          /opt o /app no coincide con los volúmenes y filesystem esperados.
+          No se modificará ningún volumen.
+
+    - name: Leer UUID configurado para /opt en fstab
+      ansible.builtin.command:
+        argv:
+          - awk
+          - '$2 == "/opt" {print $1}'
+          - /etc/fstab
+      register: harbor_opt_fstab_uuid
+      changed_when: false
+      check_mode: false
+
+    - name: Confirmar que fstab apunta al UUID original esperado
+      ansible.builtin.assert:
+        that:
+          - harbor_opt_fstab_uuid.stdout_lines | length == 1
+          - harbor_opt_fstab_uuid.stdout | trim == 'UUID=' ~ harbor_opt_old_uuid
+        fail_msg: >-
+          /etc/fstab no contiene exactamente el UUID esperado para /opt.
+          Revisa el host manualmente; no se tocará el LV.
+
+    - name: Leer UUID actual del LV de /opt
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -s
+          - UUID
+          - -o
+          - value
+          - "{{ harbor_opt_lv_device }}"
+      register: harbor_opt_current_uuid
+      changed_when: false
+      check_mode: false
+
+    - name: Confirmar que el LV contiene el UUID esperado
+      ansible.builtin.assert:
+        that:
+          - harbor_opt_current_uuid.stdout | trim == harbor_opt_old_uuid
+        fail_msg: >-
+          El UUID del LV actual no coincide con fstab. No se borrará el
+          volumen; revisa manualmente el estado de /opt.
+
+    - name: Consultar tamaño actual del LV de /opt
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --noheadings
+          - --units
+          - b
+          - --nosuffix
+          - --options
+          - lv_size
+          - "{{ harbor_opt_lv_device }}"
+      register: harbor_opt_lv_size_current
+      changed_when: false
+      check_mode: false
+
+    - name: Confirmar que el LV actual alcanza para recrear /opt con 2 GiB
+      ansible.builtin.assert:
+        that:
+          - harbor_opt_lv_size_current.stdout | trim | float >= harbor_opt_min_lv_bytes | float
+        fail_msg: >-
+          El LV actual de /opt es menor que 2 GiB; no se puede garantizar
+          capacidad para recrearlo y ampliar /app.
+
+    - name: Revisar si ya existen rutas de respaldo
+      ansible.builtin.stat:
+        path: "{{ item }}"
+      loop:
+        - "{{ harbor_opt_backup_dir }}"
+        - "{{ harbor_opt_fstab_backup }}"
+      register: harbor_opt_backup_paths
+
+    - name: Evitar sobrescribir respaldos anteriores
+      ansible.builtin.assert:
+        that:
+          - not item.stat.exists
+        fail_msg: >-
+          Ya existe {{ item.item }}. Consérvalo y define una ruta de respaldo
+          nueva antes de continuar.
+      loop: "{{ harbor_opt_backup_paths.results }}"
+
+    - name: Crear directorio privado de respaldo
+      ansible.builtin.file:
+        path: "{{ harbor_opt_backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: "0700"
+
+    - name: Respaldar el contenido actual de /opt
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -aHAXx
+          - /opt/
+          - "{{ harbor_opt_backup_dir }}/"
+      register: harbor_opt_backup_result
+      changed_when: harbor_opt_backup_result.rc == 0
+
+    - name: Guardar copia de fstab antes del cambio
+      ansible.builtin.copy:
+        src: /etc/fstab
+        dest: "{{ harbor_opt_fstab_backup }}"
+        remote_src: true
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Desmontar /opt
+      ansible.builtin.command:
+        argv:
+          - umount
+          - /opt
+      changed_when: true
+
+    - name: Eliminar el LV anterior de /opt
+      ansible.builtin.command:
+        argv:
+          - lvremove
+          - --yes
+          - "{{ harbor_opt_lv_device }}"
+      changed_when: true
+
+    - name: Crear el LV de /opt con 2 GiB
+      ansible.builtin.command:
+        argv:
+          - lvcreate
+          - --yes
+          - --size
+          - "{{ harbor_opt_lv_size }}"
+          - --name
+          - opt
+          - vgiess
+      changed_when: true
+
+    - name: Crear filesystem XFS nuevo
+      ansible.builtin.command:
+        argv:
+          - mkfs.xfs
+          - -f
+          - "{{ harbor_opt_lv_device }}"
+      changed_when: true
+
+    - name: Leer el UUID nuevo del filesystem
+      ansible.builtin.command:
+        argv:
+          - blkid
+          - -s
+          - UUID
+          - -o
+          - value
+          - "{{ harbor_opt_lv_device }}"
+      register: harbor_opt_new_uuid
+      changed_when: false
+      check_mode: false
+
+    - name: Validar el UUID nuevo
+      ansible.builtin.assert:
+        that:
+          - harbor_opt_new_uuid.stdout | trim | length > 0
+          - harbor_opt_new_uuid.stdout | trim != harbor_opt_old_uuid
+        fail_msg: No se obtuvo un UUID nuevo válido para el filesystem de /opt.
+
+    - name: Actualizar en fstab el UUID de /opt
+      ansible.builtin.replace:
+        path: /etc/fstab
+        regexp: '^UUID={{ harbor_opt_old_uuid }}(?=\s+/opt\s)'
+        replace: "UUID={{ harbor_opt_new_uuid.stdout | trim }}"
+
+    - name: Comprobar la entrada de /opt en fstab
+      ansible.builtin.command:
+        argv:
+          - awk
+          - '$2 == "/opt" {print $1}'
+          - /etc/fstab
+      register: harbor_opt_fstab_uuid_updated
+      changed_when: false
+      check_mode: false
+
+    - name: Confirmar que fstab contiene el UUID nuevo
+      ansible.builtin.assert:
+        that:
+          - harbor_opt_fstab_uuid_updated.stdout_lines | length == 1
+          - harbor_opt_fstab_uuid_updated.stdout | trim == 'UUID=' ~ (harbor_opt_new_uuid.stdout | trim)
+        fail_msg: >-
+          La entrada de /opt en fstab no coincide con el UUID recién creado.
+          Usa {{ harbor_opt_fstab_backup }} para recuperación manual.
+
+    - name: Recargar configuración de systemd
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - daemon-reload
+      changed_when: false
+
+    - name: Montar /opt usando la entrada de fstab
+      ansible.builtin.command:
+        argv:
+          - mount
+          - /opt
+      changed_when: true
+
+    - name: Restaurar el contenido de /opt
+      ansible.builtin.command:
+        argv:
+          - rsync
+          - -aHAX
+          - "{{ harbor_opt_backup_dir }}/"
+          - /opt/
+      register: harbor_opt_restore_result
+      changed_when: harbor_opt_restore_result.rc == 0
+
+    - name: Restaurar contextos SELinux de /opt
+      ansible.builtin.command:
+        argv:
+          - restorecon
+          - -Rv
+          - /opt
+      changed_when: true
+
+    - name: Ampliar /app con todos los extents libres
+      ansible.builtin.command:
+        argv:
+          - lvextend
+          - --extents
+          - +100%FREE
+          - --resizefs
+          - "{{ harbor_app_lv_device }}"
+      register: harbor_app_lv_extend
+      changed_when: harbor_app_lv_extend.rc == 0
+
+    - name: Verificar los tamaños finales de /app y /opt
+      ansible.builtin.command:
+        argv:
+          - df
+          - -h
+          - /app
+          - /opt
+      register: harbor_opt_final_df
+      changed_when: false
+      check_mode: false
+
+    - name: Mostrar el resultado de los montajes
+      ansible.builtin.debug:
+        var: harbor_opt_final_df.stdout_lines
+
+    - name: Verificar que Docker y containerd siguen activos
+      ansible.builtin.command:
+        argv:
+          - systemctl
+          - is-active
+          - "{{ item }}"
+      loop:
+        - docker
+        - containerd
+      register: harbor_opt_runtime_status
+      changed_when: false
+      check_mode: false
+
+    - name: Mostrar estado de Docker y containerd
+      ansible.builtin.debug:
+        msg: "{{ harbor_opt_runtime_status.results | map(attribute='stdout') | list }}"
+
+    - name: Consultar versión del servidor Docker
+      ansible.builtin.command:
+        argv:
+          - docker
+          - info
+          - --format
+          - "{{ '{{' }}.ServerVersion{{ '}}' }}"
+      register: harbor_opt_docker_info
+      changed_when: false
+      check_mode: false
+
+    - name: Mostrar versión del servidor Docker
+      ansible.builtin.debug:
+        var: harbor_opt_docker_info.stdout

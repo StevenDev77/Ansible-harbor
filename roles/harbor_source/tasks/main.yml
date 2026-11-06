@@ -1,0 +1,134 @@
+---
+- name: Validar credenciales administrativas y duración del robot
+  ansible.builtin.assert:
+    that:
+      - harbor_source_admin_password | length >= 12
+      - harbor_replication_robot_duration_days | int > 0
+    fail_msg: "Guarda la contraseña de admin de .207 en Vault y configura una duración positiva para el robot."
+
+- name: Validar HTTPS institucional del Harbor origen
+  ansible.builtin.uri:
+    url: "{{ harbor_source_url }}/v2/"
+    method: GET
+    ca_path: "{{ harbor_source_api_ca_src if harbor_source_api_ca_src | length > 0 else omit }}"
+    status_code: [200, 401]
+    return_content: false
+  delegate_to: localhost
+  register: harbor_source_registry_health
+  retries: 5
+  delay: 3
+  until: harbor_source_registry_health.status in [200, 401]
+  when: not ansible_check_mode
+
+- name: Comprobar archivo cifrado del robot previo
+  ansible.builtin.stat:
+    path: "{{ harbor_replication_robot_vault_file }}"
+  delegate_to: localhost
+  register: harbor_robot_vault_file
+  when: not ansible_check_mode
+
+- name: Consultar robots de sistema en Harbor .207
+  ansible.builtin.uri:
+    url: "{{ harbor_source_url }}/api/v2.0/robots?level=system&page=1&page_size=100"
+    method: GET
+    user: "{{ harbor_source_admin_user }}"
+    password: "{{ harbor_source_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    ca_path: "{{ harbor_source_api_ca_src if harbor_source_api_ca_src | length > 0 else omit }}"
+    status_code: 200
+    return_content: true
+  delegate_to: localhost
+  register: harbor_source_robots
+  no_log: true
+  when: not ansible_check_mode
+
+- name: Evitar rotar o perder el secreto de un robot previo
+  ansible.builtin.assert:
+    that:
+      - harbor_source_robots.json | selectattr('name', 'equalto', harbor_replication_robot_full_name) | list | length == 0 or harbor_robot_vault_file.stat.exists
+    fail_msg: >-
+      El robot ya existe, pero falta su archivo Vault. No se rotará automáticamente;
+      recupere el secreto o configure otro nombre de robot.
+  no_log: true
+  when: not ansible_check_mode
+
+- name: Crear robot de sistema pull-only para todos los proyectos
+  ansible.builtin.uri:
+    url: "{{ harbor_source_url }}/api/v2.0/robots"
+    method: POST
+    user: "{{ harbor_source_admin_user }}"
+    password: "{{ harbor_source_admin_password }}"
+    force_basic_auth: true
+    validate_certs: true
+    ca_path: "{{ harbor_source_api_ca_src if harbor_source_api_ca_src | length > 0 else omit }}"
+    body_format: json
+    body:
+      name: "{{ harbor_replication_robot_name }}"
+      description: Pull-only replication reader for Harbor replicas
+      level: system
+      duration: "{{ harbor_replication_robot_duration_days | int }}"
+      disable: false
+      permissions:
+        - kind: system
+          namespace: /
+          access:
+            - resource: project
+              action: list
+        - kind: project
+          namespace: "*"
+          access:
+            - resource: repository
+              action: list
+            - resource: repository
+              action: pull
+    status_code: 201
+    return_content: true
+  delegate_to: localhost
+  register: harbor_source_robot_created
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - harbor_source_robots.json | selectattr('name', 'equalto', harbor_replication_robot_full_name) | list | length == 0
+
+- name: Cifrar secreto generado con Ansible Vault
+  ansible.builtin.command:
+    argv:
+      - ansible-vault
+      - encrypt_string
+      - --vault-password-file
+      - "{{ harbor_vault_password_file }}"
+      - --stdin-name
+      - harbor_replication_source_password
+    stdin: "{{ harbor_source_robot_created.json.secret }}"
+  delegate_to: localhost
+  register: harbor_source_robot_encrypted
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - harbor_source_robot_created is not skipped
+
+- name: Crear directorio de variables Vault de Harbor réplica
+  ansible.builtin.file:
+    path: "{{ harbor_replication_robot_vault_file | dirname }}"
+    state: directory
+    mode: "0700"
+  delegate_to: localhost
+  when:
+    - not ansible_check_mode
+    - harbor_source_robot_created is not skipped
+
+- name: Guardar username y secreto cifrado del robot
+  ansible.builtin.copy:
+    dest: "{{ harbor_replication_robot_vault_file }}"
+    mode: "0600"
+    content: |
+      harbor_configure_replication: true
+      harbor_replication_source_url: {{ harbor_source_url | to_json }}
+      harbor_replication_source_user: {{ harbor_source_robot_created.json.name | to_json }}
+      {{ harbor_source_robot_encrypted.stdout }}
+  delegate_to: localhost
+  no_log: true
+  when:
+    - not ansible_check_mode
+    - harbor_source_robot_created is not skipped

@@ -1,0 +1,9 @@
+---
+rke2_harbor_source_registry: registry.iess.gob.ec
+rke2_harbor_endpoints:
+  - 192.168.114.207
+  - 192.168.114.209
+  - 192.168.114.134
+rke2_harbor_ca_src: ""
+rke2_harbor_ca_dest: /etc/rancher/rke2/harbor-poc-ca.crt
+rke2_harbor_registry_auth: {}

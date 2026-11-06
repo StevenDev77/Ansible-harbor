@@ -1,0 +1,34 @@
+---
+harbor_version: "v2.10.2"
+harbor_installer_url: "https://github.com/goharbor/harbor/releases/download/{{ harbor_version }}/harbor-online-installer-{{ harbor_version }}.tgz"
+harbor_installer_archive: "/var/tmp/harbor-online-installer-{{ harbor_version }}.tgz"
+harbor_installer_src: ""
+harbor_install_dir: /opt/harbor
+
+harbor_data_mountpoint: /app
+harbor_data_volume: /app/harbor/data
+harbor_min_free_bytes: 42949672960
+
+harbor_hostname: ""
+harbor_http_port: 80
+harbor_https_port: 443
+harbor_tls_dir: /app/harbor/cert
+harbor_tls_cert_path: "{{ harbor_tls_dir }}/server.crt"
+harbor_tls_key_path: "{{ harbor_tls_dir }}/server.key"
+harbor_tls_cert_src: ""
+harbor_tls_key_src: ""
+harbor_api_ca_src: ""
+
+harbor_admin_password: ""
+harbor_database_password: ""
+harbor_projects: []
+
+harbor_configure_replication: false
+harbor_replication_source_url: https://registry.iess.gob.ec
+harbor_replication_source_user: ""
+harbor_replication_source_password: ""
+harbor_replication_source_ca_src: ""
+harbor_trust_cert_dir: "{{ harbor_install_dir }}/harbor/common/config/shared/trust-certificates"
+harbor_replication_endpoint_name: harbor-207-pull
+harbor_replication_policy_name: pull-all-from-207
+harbor_replication_cron: "0 */15 * * *"

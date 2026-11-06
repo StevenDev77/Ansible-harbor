@@ -1,0 +1,23 @@
+hostname: {{ harbor_hostname }}
+
+http:
+  port: {{ harbor_http_port }}
+
+https:
+  port: {{ harbor_https_port }}
+  certificate: {{ harbor_tls_cert_path }}
+  private_key: {{ harbor_tls_key_path }}
+
+harbor_admin_password: {{ harbor_admin_password | to_json }}
+
+database:
+  password: {{ harbor_database_password | to_json }}
+
+data_volume: {{ harbor_data_volume }}
+
+log:
+  level: info
+  local:
+    rotate_count: 50
+    rotate_size: 200M
+    location: /var/log/harbor

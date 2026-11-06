@@ -1,0 +1,16 @@
+---
+harbor_pki_dir: /opt/ansible-harbor-private/pki
+harbor_pki_ca_name: poc-ca
+harbor_pki_ca_common_name: Harbor PoC CA
+harbor_pki_endpoints:
+  - name: harbor-209
+    ip: 192.168.114.209
+    common_name: 192.168.114.209
+    dns_names: []
+  - name: harbor-134
+    ip: 192.168.114.134
+    common_name: 192.168.114.134
+    dns_names: []
+harbor_pki_replica_hosts:
+  - harbor_209
+  - harbor_134

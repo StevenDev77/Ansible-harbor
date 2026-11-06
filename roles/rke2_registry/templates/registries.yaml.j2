@@ -1,0 +1,16 @@
+mirrors:
+  "{{ rke2_harbor_source_registry }}":
+    endpoint:
+{% for harbor_ip in rke2_harbor_endpoints %}
+      - "https://{{ harbor_ip }}"
+{% endfor %}
+
+configs:
+{% for registry_host, credentials in rke2_harbor_registry_auth.items() %}
+  "{{ registry_host }}":
+    auth:
+      username: {{ credentials.username | to_json }}
+      password: {{ credentials.password | to_json }}
+    tls:
+      ca_file: "{{ rke2_harbor_ca_dest }}"
+{% endfor %}

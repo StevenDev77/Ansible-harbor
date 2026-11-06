@@ -1,0 +1,10 @@
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature,keyEncipherment
+extendedKeyUsage=serverAuth
+subjectAltName=@alt_names
+
+[alt_names]
+IP.1={{ item.ip }}
+{% for dns_name in item.dns_names %}
+DNS.{{ loop.index }}={{ dns_name }}
+{% endfor %}

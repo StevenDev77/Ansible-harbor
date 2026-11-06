@@ -1,0 +1,13 @@
+---
+- name: Instalar Harbor independiente en los nodos de réplica
+  hosts: harbor_replicas
+  become: true
+  gather_facts: true
+  serial: 1
+
+  module_defaults:
+    ansible.builtin.uri:
+      ca_path: "{{ harbor_api_ca_src }}"
+
+  roles:
+    - role: harbor

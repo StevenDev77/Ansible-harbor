@@ -1,0 +1,11 @@
+---
+harbor_source_url: https://registry.iess.gob.ec
+harbor_source_admin_user: admin
+harbor_source_admin_password: ""
+harbor_source_api_ca_src: ""
+harbor_replication_robot_name: harbor-replication-reader
+harbor_replication_robot_prefix: "robot$"
+harbor_replication_robot_duration_days: 365
+harbor_replication_robot_full_name: "{{ harbor_replication_robot_prefix ~ harbor_replication_robot_name }}"
+harbor_replication_robot_vault_file: "{{ playbook_dir }}/../inventory/group_vars/harbor_replicas/replication-robot.yml"
+harbor_vault_password_file: "{{ lookup('env', 'HOME') }}/.ansible/vault-password"

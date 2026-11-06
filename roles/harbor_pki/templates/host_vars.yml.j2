@@ -1,0 +1,4 @@
+harbor_hostname: "{{ endpoint.ip }}"
+harbor_tls_cert_src: "{{ harbor_pki_dir }}/{{ endpoint.name }}.crt"
+harbor_tls_key_src: "{{ harbor_pki_dir }}/{{ endpoint.name }}.key"
+harbor_api_ca_src: "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.crt"

@@ -1,0 +1,94 @@
+---
+- name: Ampliar /app del Harbor réplica .209
+  hosts: harbor_209
+  become: true
+  gather_facts: true
+
+  vars:
+    harbor_app_lv_device: /dev/mapper/vgiess-app
+    harbor_app_vg_name: vgiess
+    harbor_app_target_size: 60G
+    harbor_app_target_bytes: 64424509440
+    harbor_app_min_free_bytes: 42949672960
+
+  tasks:
+    - name: Confirmar que /app es el LV esperado y usa XFS o ext4
+      ansible.builtin.assert:
+        that:
+          - ansible_mounts | selectattr('mount', 'equalto', '/app') | list | length == 1
+          - (ansible_mounts | selectattr('mount', 'equalto', '/app') | first).device == harbor_app_lv_device
+          - (ansible_mounts | selectattr('mount', 'equalto', '/app') | first).fstype in ['xfs', 'ext4']
+        fail_msg: >-
+          /app no coincide con {{ harbor_app_lv_device }} o usa un filesystem no soportado.
+          No se hará ningún cambio; revise el layout antes de continuar.
+
+    - name: Leer tamaño actual del logical volume
+      ansible.builtin.command:
+        argv:
+          - lvs
+          - --noheadings
+          - --units
+          - b
+          - --nosuffix
+          - --options
+          - lv_size
+          - "{{ harbor_app_lv_device }}"
+      register: harbor_app_lv_size
+      changed_when: false
+      check_mode: false
+
+    - name: Leer extents libres del volume group
+      ansible.builtin.command:
+        argv:
+          - vgs
+          - --noheadings
+          - --units
+          - b
+          - --nosuffix
+          - --options
+          - vg_free
+          - "{{ harbor_app_vg_name }}"
+      register: harbor_app_vg_free
+      changed_when: false
+      check_mode: false
+
+    - name: Validar capacidad disponible sin reducir ni modificar otros volúmenes
+      ansible.builtin.assert:
+        that:
+          - (harbor_app_lv_size.stdout | trim | float) >= (harbor_app_target_bytes | float) or (harbor_app_vg_free.stdout | trim | float) >= ((harbor_app_target_bytes | float) - (harbor_app_lv_size.stdout | trim | float))
+        fail_msg: >-
+          El VG {{ harbor_app_vg_name }} no tiene extents suficientes para ampliar {{ harbor_app_lv_device }}
+          a {{ harbor_app_target_size }}. Amplíe primero el disco/partición/PV desde la plataforma
+          de virtualización y vuelva a ejecutar. No se modificó ningún volumen.
+
+    - name: Ampliar /app a 60 GiB y crecer el filesystem
+      ansible.builtin.command:
+        argv:
+          - lvextend
+          - --yes
+          - --resizefs
+          - --size
+          - "{{ harbor_app_target_size }}"
+          - "{{ harbor_app_lv_device }}"
+      when: (harbor_app_lv_size.stdout | trim | float) < (harbor_app_target_bytes | float)
+      register: harbor_app_lv_extend
+
+    - name: Medir espacio libre después del crecimiento
+      ansible.builtin.command:
+        argv:
+          - df
+          - --output=avail
+          - --block-size=1
+          - /app
+      register: harbor_app_free_after
+      changed_when: false
+      check_mode: false
+
+    - name: Confirmar al menos 40 GiB libres en /app
+      ansible.builtin.assert:
+        that:
+          - (harbor_app_free_after.stdout_lines[-1] | trim | int) >= harbor_app_min_free_bytes
+        fail_msg: >-
+          /app no alcanzó 40 GiB libres después del crecimiento. Revisa el filesystem y
+          aumenta el LV objetivo solo después de comprobar el espacio libre del VG.
+        success_msg: "/app tiene al menos 40 GiB libres y está listo para la réplica inicial."

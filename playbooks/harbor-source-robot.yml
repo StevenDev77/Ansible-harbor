@@ -1,0 +1,9 @@
+---
+- name: Crear robot de solo lectura para replicación desde Harbor .207
+  hosts: harbor_source
+  gather_facts: false
+  become: false
+  connection: local
+
+  roles:
+    - role: harbor_source

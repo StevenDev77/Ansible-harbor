@@ -1,0 +1,8 @@
+---
+- name: Emitir CA PoC y certificados TLS para Harbor
+  hosts: localhost
+  connection: local
+  gather_facts: false
+
+  roles:
+    - role: harbor_pki

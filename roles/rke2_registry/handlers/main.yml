@@ -1,0 +1,5 @@
+---
+- name: Reiniciar servicio RKE2 para aplicar mirrors
+  ansible.builtin.service:
+    name: "{{ rke2_service }}"
+    state: restarted

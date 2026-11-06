@@ -1,0 +1,165 @@
+---
+- name: Validar herramientas OpenSSL disponibles
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - version
+  changed_when: false
+
+- name: Crear directorio privado de PKI fuera del proyecto
+  ansible.builtin.file:
+    path: "{{ harbor_pki_dir }}"
+    state: directory
+    mode: "0700"
+
+- name: Generar llave privada de la CA PoC
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - genrsa
+      - -out
+      - "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.key"
+      - "4096"
+    creates: "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.key"
+  no_log: true
+
+- name: Proteger llave privada de la CA PoC
+  ansible.builtin.file:
+    path: "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.key"
+    owner: "{{ lookup('env', 'USER') }}"
+    mode: "0600"
+
+- name: Emitir certificado raíz de la CA PoC
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -x509
+      - -new
+      - -key
+      - "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.key"
+      - -sha256
+      - -days
+      - "3650"
+      - -subj
+      - "/CN={{ harbor_pki_ca_common_name }}"
+      - -addext
+      - "basicConstraints=critical,CA:TRUE"
+      - -addext
+      - "keyUsage=critical,keyCertSign,cRLSign"
+      - -out
+      - "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.crt"
+    creates: "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.crt"
+  no_log: true
+
+- name: Proteger certificado público de la CA PoC
+  ansible.builtin.file:
+    path: "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.crt"
+    owner: "{{ lookup('env', 'USER') }}"
+    mode: "0644"
+
+- name: Generar llave privada para cada Harbor
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - genrsa
+      - -out
+      - "{{ harbor_pki_dir }}/{{ item.name }}.key"
+      - "2048"
+    creates: "{{ harbor_pki_dir }}/{{ item.name }}.key"
+  loop: "{{ harbor_pki_endpoints }}"
+  no_log: true
+
+- name: Proteger llaves privadas de los Harbors
+  ansible.builtin.file:
+    path: "{{ harbor_pki_dir }}/{{ item.name }}.key"
+    owner: "{{ lookup('env', 'USER') }}"
+    mode: "0600"
+  loop: "{{ harbor_pki_endpoints }}"
+
+- name: Generar CSR para cada Harbor
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - req
+      - -new
+      - -key
+      - "{{ harbor_pki_dir }}/{{ item.name }}.key"
+      - -subj
+      - "/CN={{ item.common_name }}"
+      - -out
+      - "{{ harbor_pki_dir }}/{{ item.name }}.csr"
+    creates: "{{ harbor_pki_dir }}/{{ item.name }}.csr"
+  loop: "{{ harbor_pki_endpoints }}"
+  no_log: true
+
+- name: Crear extensiones SAN para cada Harbor
+  ansible.builtin.template:
+    src: server.ext.j2
+    dest: "{{ harbor_pki_dir }}/{{ item.name }}.ext"
+    mode: "0600"
+  loop: "{{ harbor_pki_endpoints }}"
+  no_log: true
+
+- name: Firmar certificados de servidor con la CA PoC
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -req
+      - -in
+      - "{{ harbor_pki_dir }}/{{ item.name }}.csr"
+      - -CA
+      - "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.crt"
+      - -CAkey
+      - "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.key"
+      - -CAcreateserial
+      - -days
+      - "825"
+      - -sha256
+      - -extfile
+      - "{{ harbor_pki_dir }}/{{ item.name }}.ext"
+      - -out
+      - "{{ harbor_pki_dir }}/{{ item.name }}.crt"
+    creates: "{{ harbor_pki_dir }}/{{ item.name }}.crt"
+  loop: "{{ harbor_pki_endpoints }}"
+  no_log: true
+
+- name: Validar cadena de cada certificado Harbor
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - verify
+      - -CAfile
+      - "{{ harbor_pki_dir }}/{{ harbor_pki_ca_name }}.crt"
+      - "{{ harbor_pki_dir }}/{{ item.name }}.crt"
+  loop: "{{ harbor_pki_endpoints }}"
+  changed_when: false
+
+- name: Validar IP SAN de cada certificado Harbor
+  ansible.builtin.command:
+    argv:
+      - openssl
+      - x509
+      - -in
+      - "{{ harbor_pki_dir }}/{{ item.name }}.crt"
+      - -checkip
+      - "{{ item.ip }}"
+      - -noout
+  loop: "{{ harbor_pki_endpoints }}"
+  changed_when: false
+
+- name: Crear directorio host_vars
+  ansible.builtin.file:
+    path: "{{ playbook_dir }}/../inventory/host_vars"
+    state: directory
+    mode: "0700"
+
+- name: Generar host_vars de Harbor réplica
+  ansible.builtin.template:
+    src: host_vars.yml.j2
+    dest: "{{ playbook_dir }}/../inventory/host_vars/{{ item }}.yml"
+    mode: "0600"
+  loop: "{{ harbor_pki_replica_hosts }}"
+  vars:
+    endpoint: "{{ harbor_pki_endpoints | selectattr('name', 'equalto', item | replace('harbor_', 'harbor-')) | first }}"
